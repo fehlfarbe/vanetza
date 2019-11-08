@@ -29,6 +29,12 @@
 #include <tuple>
 #include <type_traits>
 
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <math.h>
+#include <iostream>
+#include <boost/asio.hpp>
+
 namespace vanetza
 {
 namespace geonet
@@ -344,7 +350,9 @@ DataConfirm Router::request(const TsbDataRequest&, DownPacketPtr)
 void Router::indicate(UpPacketPtr packet, const MacAddress& sender, const MacAddress& destination)
 {
     assert(packet);
-
+    if(destination != cBroadcastMacAddress){
+        std::cout << m_local_position_vector.gn_addr.mid() << " got packet from " << sender << " to " << destination << std::endl;
+    }
     struct indication_visitor : public boost::static_visitor<>
     {
         indication_visitor(Router& router, const IndicationContext::LinkLayer& link_layer, UpPacketPtr packet) :
@@ -600,6 +608,9 @@ NextHop Router::forwarding_algorithm_selection(PendingPacketForwarding&& packet,
             case BroadcastForwarding::Advanced:
                 nh = area_advanced_forwarding(std::move(packet), ll);
                 break;
+            case BroadcastForwarding::NN:
+                nh = area_nn_forwarding(std::move(packet), ll);
+                break;
             default:
                 throw std::runtime_error("unhandled area forwarding algorithm");
                 break;
@@ -618,6 +629,9 @@ NextHop Router::forwarding_algorithm_selection(PendingPacketForwarding&& packet,
                     break;
                 case UnicastForwarding::CBF:
                     nh = non_area_contention_based_forwarding(std::move(packet), ll ? &ll->sender : nullptr);
+                    break;
+                case UnicastForwarding::NN:
+                    nh = non_area_nn_forwarding(std::move(packet), ll ? &ll->sender : nullptr);
                     break;
                 default:
                     throw std::runtime_error("unhandled non-area forwarding algorithm");
@@ -681,6 +695,10 @@ void Router::pass_down(const MacAddress& addr, PduPtr pdu, DownPacketPtr payload
     request.dcc_profile = map_tc_onto_profile(pdu->common().traffic_class);
     request.ether_type = geonet::ether_type;
     request.lifetime = std::chrono::seconds(pdu->basic().lifetime.decode() / units::si::seconds);
+
+    if(request.destination != cBroadcastMacAddress) {
+        std::cout << "passing down request " << request.source << " to " << request.destination << std::endl;
+    }
 
     pass_down(request, std::move(pdu), std::move(payload));
 }
@@ -814,6 +832,187 @@ NextHop Router::non_area_contention_based_forwarding(PendingPacketForwarding&& p
     return nh;
 }
 
+NextHop Router::non_area_nn_forwarding(PendingPacketForwarding&& packet, const MacAddress* sender){
+    NextHop nh;
+
+//    if(!sender){
+////        std::cout << "sender == NULL" << std::endl;
+//        nh.transmit(std::move(packet), cBroadcastMacAddress);
+//        return nh;
+//    }
+
+    boost::property_tree::ptree root;
+    boost::property_tree::ptree ego;
+    boost::property_tree::ptree beacons;
+    boost::property_tree::ptree destination;
+    boost::property_tree::ptree msg;
+
+    // message id
+    msg.put("uuid", (uint16_t)packet.pdu().extended().sequence_number);
+    msg.put("hop", (uint16_t)packet.pdu().common().maximum_hop_limit-packet.pdu().basic().hop_limit);
+    msg.put("hop_max", (uint16_t)packet.pdu().common().maximum_hop_limit);
+    msg.put("time_start", m_local_position_vector.timestamp.raw());
+    msg.put("time_curr", m_local_position_vector.timestamp.raw());
+    msg.put("time_max", packet.pdu().basic().lifetime.raw());
+    root.add_child("msg", msg);
+
+    // ego pos, speed, heading
+    double ego_lat = m_local_position_vector.position().latitude.value();
+    double ego_lon = m_local_position_vector.position().longitude.value();
+    double ego_speed = m_local_position_vector.speed.value().raw() / 100.0;
+//    double ego_heading = m_local_position_vector.heading.value() * 10;
+//    double ego_vx = std::sin(ego_heading * (M_PI/180.0)) * ego_speed;
+//    double ego_vy = std::cos(ego_heading * (M_PI/180.0)) * ego_speed;
+    auto ego_heading = ((0xFFFF - m_local_position_vector.heading.value()) / 10.) + 90;
+    double ego_vx = std::cos(ego_heading * (M_PI / 180.0)) * ego_speed;
+    double ego_vy = std::sin(ego_heading * (M_PI / 180.0)) * ego_speed;
+
+    ego.put("x", ego_lon);
+    ego.put("y", ego_lat);
+    ego.put("vx", ego_vx);
+    ego.put("vy", ego_vy);
+    ego.put("id", this->m_local_position_vector.gn_addr.mid());
+
+    std::string sender_addr = "null";
+    if(sender){
+        std::stringstream ss;
+        ss << *sender;
+        sender_addr = ss.str();
+    }
+
+    std::cout << "got message with ID " << (uint16_t)packet.pdu().extended().sequence_number
+    << " hop: " << (uint16_t)packet.pdu().common().maximum_hop_limit-packet.pdu().basic().hop_limit << "/"
+    << (uint16_t)packet.pdu().common().maximum_hop_limit
+    << " time_start " << m_local_position_vector.timestamp.raw()
+    << " lifetime " << (uint8_t)packet.pdu().basic().lifetime.raw()
+    << " from " << sender_addr << " my address is " << this->m_local_position_vector.gn_addr.mid() << std::endl;
+
+    root.add_child("ego", ego);
+
+    // neighbor table
+    for(const LocationTableEntry& b : m_location_table.neighbours()){
+        if(b.is_neighbour() && (m_local_position_vector.timestamp - b.get_position_vector().timestamp).value() < 1000) {
+            boost::property_tree::ptree beacon;
+            double speed = b.get_position_vector().speed.value().raw() / 100.0;
+            auto heading = ((0xFFFF - b.get_position_vector().heading.value()) / 10.) + 90;
+            double b_vx = std::cos(heading * (M_PI / 180.0)) * speed;
+            double b_vy = std::sin(heading * (M_PI / 180.0)) * speed;
+            std::cout   << "\t" << b.geonet_address().mid() << " at "
+                    <<  b.get_position_vector().position().latitude.value()
+                    << ", "
+                    << b.get_position_vector().position().longitude.value()
+                    << " with "
+                    << speed << "m/s "
+                    << heading << "deg (" << 0xFFFF - b.get_position_vector().heading.value() << ") "
+                    << b_vx << " "
+                    << b_vy << " "
+                    << (m_local_position_vector.timestamp - b.get_position_vector().timestamp).value()
+                    << std::endl;
+
+            beacon.put("x", b.get_position_vector().position().longitude.value());
+            beacon.put("y", b.get_position_vector().position().latitude.value());
+            beacon.put("vx", b_vx);
+            beacon.put("vy", b_vy);
+            beacon.put("id", b.link_layer_address());
+            beacons.push_back(std::make_pair("", beacon));
+        }
+    }
+
+    // add ego to beacons
+    beacons.push_back(std::make_pair("", ego));
+
+    root.add_child("beacons", beacons);
+
+    // destination area
+    const GeoBroadcastHeader& gbc = packet.pdu().extended();
+    const HeaderType ht = packet.pdu().common().header_type;
+    const Area destination_area = gbc.destination(ht);
+    double dest_lat = destination_area.position.latitude.value();
+    double dest_lon = destination_area.position.longitude.value();
+    double dest_r = boost::get<vanetza::geonet::Circle>(destination_area.shape).r.value();
+
+    destination.put("x", dest_lon);
+    destination.put("y", dest_lat);
+    destination.put("r", dest_r);
+    root.add_child("recipient", destination);
+
+
+//    // convert to JSON
+//    std::stringstream ss;
+//    boost::property_tree::json_parser::write_json(ss, root);
+////    std::cout << ss.str() << std::endl;
+//
+//    // send to NN via TCP
+//    boost::asio::io_service io_service;
+//    boost::asio::ip::tcp::resolver resolver(io_service);
+//    boost::asio::ip::tcp::resolver::query query(boost::asio::ip::tcp::v4(), "127.0.0.1", "7777");
+//    boost::asio::ip::tcp::resolver::iterator iterator = resolver.resolve(query);
+//
+//    boost::asio::ip::tcp::socket s(io_service);
+//    boost::asio::connect(s, iterator);
+//
+////    std::cin.getline(ss.str().c_str(), ss.str().length());
+//    boost::asio::write(s, boost::asio::buffer(ss.str(), ss.str().length()));
+//
+//    std::cout << "Waiting for response" << std::endl;
+//
+//    // get response
+//    char reply[1024];
+//    size_t reply_length = boost::asio::read(s,
+//                                            boost::asio::buffer(reply, 1024),
+//                                            boost::asio::transfer_at_least(1));
+//    std::cout << "Reply is: ";
+//    std::cout.write(reply, reply_length);
+//    std::cout << "\n";
+//    reply[reply_length] = '\0';
+
+
+
+    // select neighbor from table and set next hop
+    MacAddress next_addr;
+    // TEST TEST TEST
+    // neighbor table
+    GeodeticPosition dest = packet.pdu().extended().position();
+    const units::Length own = distance(dest, m_local_position_vector.position());
+    units::Length mfr_dist = own;
+    for(const LocationTableEntry& b : m_location_table.neighbours()){
+        if(b.is_neighbour() && (m_local_position_vector.timestamp - b.get_position_vector().timestamp).value() < 1000) {
+            units::Length dist = distance(b.get_position_vector().position(), m_local_position_vector.position());
+            if(dist < mfr_dist){
+                next_addr = b.link_layer_address();
+                mfr_dist = dist;
+            }
+        }
+    }
+    nh.transmit(std::move(packet), next_addr);
+    return nh;
+
+
+//    bool parsed = parse_mac_address(std::string(reply), next_addr);
+//    bool self_msg = false;
+//    if(parsed && this->m_local_position_vector.gn_addr.mid() == next_addr) {
+//        self_msg = true;
+//    }
+//
+//    if(parsed && !self_msg){
+//        nh.transmit(std::move(packet), next_addr);
+//        std::cout << "nh transmit from " << this->m_local_position_vector.gn_addr.mid() << " to: " << nh.mac() << " " << nh.valid() << std::endl;
+//    } else {
+////        std::function<void(PendingPacketForwarding&&)> greedy_fwd = [this](PendingPacketForwarding&& packet) {
+////            NextHop nh = greedy_forwarding(std::move(packet));
+////            std::move(nh).process();
+////        };
+////        PendingPacket<GbcPdu> greedy_packet(std::move(packet), greedy_fwd);
+////        PacketBuffer::data_ptr data { new PendingPacketBufferData<GbcPdu>(std::move(greedy_packet)) };
+////        m_bc_forward_buffer.push(std::move(data), m_runtime.now());
+//        std::cout << next_addr << std::endl;
+//        std::cout << "buffer packet" << std::endl;
+//        nh.buffer();
+//    }
+//
+//    return nh;
+}
+
 NextHop Router::area_contention_based_forwarding(PendingPacketForwarding&& packet, const MacAddress* sender)
 {
     NextHop nh;
@@ -828,6 +1027,12 @@ NextHop Router::area_contention_based_forwarding(PendingPacketForwarding&& packe
         m_cbf_buffer.enqueue(CbfPacket { std::move(packet), *sender }, clock_cast(timeout));
         nh.buffer();
     }
+    return nh;
+}
+
+NextHop Router::area_nn_forwarding(PendingPacketForwarding&& packet, const LinkLayer* sender){
+    NextHop nh;
+    std::cout << "Todo NN routing" << std::endl;
     return nh;
 }
 
@@ -1011,6 +1216,8 @@ bool Router::process_extended(const ExtendedPduConstRefs<GeoBroadcastHeader>& pd
     const Address& source_addr = gbc.source_position.gn_addr;
     const Area dest_area = gbc.destination(pdu.common().header_type);
 
+//    std::cout << "processing extended from " << ll.sender << std::endl;
+
     // remember if LocTE(SO) exists (5) before duplicate packet detection might (3) silently create an entry
     const bool locte_exists = m_location_table.has_entry(source_addr);
 
@@ -1020,7 +1227,8 @@ bool Router::process_extended(const ExtendedPduConstRefs<GeoBroadcastHeader>& pd
     bool duplicate_packet = false;
     if (!within_destination) {
         if (m_mib.itsGnNonAreaForwardingAlgorithm == UnicastForwarding::Unspecified ||
-            m_mib.itsGnNonAreaForwardingAlgorithm == UnicastForwarding::Greedy) {
+            m_mib.itsGnNonAreaForwardingAlgorithm == UnicastForwarding::Greedy ||
+            m_mib.itsGnNonAreaForwardingAlgorithm == UnicastForwarding::NN) {
             duplicate_packet = detect_duplicate_packet(source_addr, gbc.sequence_number);
         }
     // step 3b
@@ -1032,6 +1240,7 @@ bool Router::process_extended(const ExtendedPduConstRefs<GeoBroadcastHeader>& pd
     }
     // step 3a & 3b
     if (duplicate_packet) {
+//        std::cout << "duplicate packet" << std::endl;
         // omit execution of further steps
         return false;
     }
@@ -1103,6 +1312,8 @@ bool Router::process_extended(const ExtendedPduConstRefs<GeoBroadcastHeader>& pd
         PendingPacket<GbcPdu, const MacAddress&> tmp(std::move(packet), transmit);
         NextHop forwarding = forwarding_algorithm_selection(std::move(tmp), &ll);
 
+        std::cout << "forwarding: " << forwarding.mac() << std::endl;
+
         // step 12: transmit immediately if not buffered or discarded
         std::move(forwarding).process();
     };
@@ -1130,6 +1341,7 @@ void Router::flush_broadcast_forwarding_buffer()
 void Router::flush_unicast_forwarding_buffer(const Address& source)
 {
     // TODO flush only packets for given source address (required for GUC packets)
+//    std::cout << "flushing unicast buffer" << std::endl;
     m_uc_forward_buffer.flush(m_runtime.now());
 }
 
@@ -1144,7 +1356,7 @@ void Router::detect_duplicate_address(const Address& source, const MacAddress& s
             for (auto& octet : random_mac_addr.octets) {
                 octet = octet_dist(m_random_gen);
             }
-
+            std::cout << "duplicate address detected!" << std::endl;
             m_local_position_vector.gn_addr.mid(random_mac_addr);
         }
     }

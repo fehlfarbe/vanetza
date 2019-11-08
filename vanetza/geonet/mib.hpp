@@ -20,14 +20,18 @@ namespace geonet
 enum class UnicastForwarding {
     Unspecified = 0,
     Greedy = 1,
-    CBF = 2
+    CBF = 2,
+    // adds neural network forwarding
+    NN = 3
 };
 
 enum class BroadcastForwarding {
     Unspecified = 0,
     SIMPLE = 1,
     CBF = 2,
-    Advanced = 3
+    Advanced = 3,
+    // adds neural network forwarding
+    NN = 4
 };
 
 enum class AddrConfMethod {

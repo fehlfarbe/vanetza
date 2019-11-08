@@ -433,6 +433,15 @@ private:
      * \return next hop
      */
     NextHop non_area_contention_based_forwarding(PendingPacketForwarding&&, const MacAddress* sender);
+    /**
+     * \brief Determine next hop for non-area nn forwarding
+     *
+     * \param pdu
+     * \param payload
+     * \param sender optional sender MAC address (if not first hop)
+     * \return next hop
+     */
+    NextHop non_area_nn_forwarding(PendingPacketForwarding&&, const MacAddress* sender);
 
     /**
      * \brief Determine next hop for area contention-based forwarding
@@ -477,6 +486,16 @@ private:
      * \return next hop
      */
     NextHop area_advanced_forwarding(PendingPacketForwarding&&, const LinkLayer* sender);
+
+    /**
+     * \brief Determine next hop for area nn forwarding
+     *
+     * \param pdu
+     * \param payload
+     * \param ll optional link-layer control info (if not source operations)
+     * \return next hop
+     */
+    NextHop area_nn_forwarding(PendingPacketForwarding&&, const LinkLayer* sender);
 
     /**
      * \brief Callback function for dispatching a packet repetition.
